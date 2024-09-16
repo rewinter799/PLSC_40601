@@ -1,0 +1,727 @@
+---
+title: "PLSC 40601: Final Project"
+author: "Robert Winter"
+format: pdf
+editor: visual
+
+# highlight-style: pygments
+geometry:
+      - top=30mm
+      - left=30mm
+# toc: true
+# toc-title: Table of Contents
+number-sections: true
+
+# Suppress output for assignments
+echo: true
+warning: false
+output: true
+
+# Wrap code chunk text
+include-in-header:
+  text: |
+    \usepackage{fvextra}
+    \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+bibliography: references.bib
+---
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+
+library(tidyverse)
+library(ggplot2)
+library(ggallin)
+library(scales)
+
+library(caret)
+
+# Trees
+library(rpart)
+library(rpart.plot)
+
+# 3D plots
+library(rgl)
+library(plotly)
+
+# Packages used/endorsed by Wager and Athey (2018)
+library(randomForest)
+library(causalTree) # "for building individual trees". See https://github.com/susanathey/causalTree
+# library(randomForestCI) # "for computing \hat{V}_{ij}". DEPRECATED: See https://github.com/swager/randomForestCI
+library(FNN) # "for k-NN regression" # See https://cran.r-project.org/web/packages/FNN/FNN.pdf
+library(grf) # "a newer, higher-performance implementation of causal forests". See https://github.com/grf-labs/grf
+library(ranger) # fast random forests. See https://github.com/imbs-hl/ranger
+```
+
+# Introduction
+
+In *Estimation and Inference of Heterogeneous Treatment Effects using Random Forests*, Wager and Athey (2018) "develop a non-parametric *causal forest* for estimating heterogeneous treatment effects that extends Breiman's widely used random forest algorithm" [@wager2018]. As motivation, Wager and Athey (2018) write that "classical approaches to nonparametric estimation of heterogeneous treatment effects" like "nearest neighbor matching\ldots perform well in applications with a small number of covariates, but quickly break down as the number of covariates increases" [@wager2018]. Wager and Athey (2018) go on to "compare the performance of \[their\] causal forest algorithm against classical $k$-nearest neighbor matching using simulations, finding that the causal forest dominates in terms of both bias and variance in a variety of settings, and that its advantage increases with the number of covariates" [@wager2018].
+
+However, Wager and Athey's (2018) analysis does not consider (at least) one problem that can arise in real-world data analysis: covariate shift. Covariate shift occurs when the range and/or distribution of covariates used to estimate treatment effects are different in the prediction data than they were in the training data. Lecca (2021) explains that "most models," including $k$-nearest neighbors, struggle in the presence of covariate shift, but random forest algorithms perform "especially" poorly [@lecca2021]. In this tutorial, we review the mechanisms of causal forests and causal $k$-nearest neighbors, and demonstrate that while causal forests may have lower mean squared errors than causal $k$-nearest neighbors in the absence of covariate shift, the two methods' mean squared errors are comparable in the presence of covariate shift.
+
+Specifically, in Section 2, we set up a treatment effect estimation problem that we will revisit throughout the tutorial. In Section 3, we review causal forests, and in Section 4, we review causal KNN algorithms. Finally, in Section 5, we compare the treatment effect estimates of causal forests and causal KNN methods under covariate shift. Throughout the tutorial, we model our notation and simulations after Wager and Athey (2018), Kricke and Peschenz (2019), Wang (2024), and the documentation for R's `grf` package.
+
+<!--# OLD TEXT: Despite Wager and Athey's (2018) findings, causal forests have not supplanted causal $k$-nearest neighbor ("KNN") methods. The reason for causal KNN's perseverance is (at least) twofold. Firstly, just as Wager and Athey (2018) leverage the "adaptive nearest neighbor" nature of regression/classification trees and random forests to develop causal trees and forests, researchers have developed adaptive versions of the KNN algorithm to recover causal effects. In particular, echoing Wager and Athey's (2018) concern that nearest neighbor matching performs poorly with large numbers of covariates, Zhou and Kosorok (2017) develop "an adaptive causal $k$-nearest neighbor method to perform metric selection and variable selection simultaneously" [@zhou2017]. Secondly, certain challenges affect both causal forests and causal KNN, and based on Wager and Athey's (2018) findings alone, it is not obvious which method is more robust to these challenges. In particular, Lecca (2021) explains that in the presence of covariate shift—when the range and/or distribution of covariates are different in the prediction data than they were in the training data—"most models," including KNN, struggle, but random forests perform "especially" poorly [@lecca2021]. However, Lecca (2021) does not quantify this poor performance, and as such, it is not obvious which method is preferred in cases where covariate shift is a concern. -->
+
+# Problem Setup
+
+Consider the following problem, adapted from the simulations in Section 5 of Wager and Athey (2018). We are interested in estimating the average treatment effect of a randomly assigned treatment on individuals' outcomes, *conditional* on certain attributes of those individuals, where each individual has a 50/50 chance of being assigned to treatment. In particular, for each individual $i$, we observe five covariates $X_{i1}, X_{i2}, X_{i3}, X_{i4}, \text{and } X_{i5}$; their treatment status $W_i\in\{0,1\}$, where $W_i=1$ denotes that the individual has been treated; and their outcome $Y_i$. We assume that the usual causal inference assumptions—including unconfoundedness, positivity, and SUTVA—hold true, so that each individual has well-defined potential outcomes under the treatment and control conditions. That is, if individual $i$ is treated ($W_i=1$), her outcome would be $Y_i^1$, and if she is not treated ($W_i=0$), her outcome would be $Y_i^0$. Of course, since each individual $i$ either *is* or *isn't* treated, only one of $Y_i^0$ and $Y_i^1$ is observed: if $W_i=0$ then $Y_i=Y_i^0$, and if $W_i=1$ then $Y_i=Y_i^1$.
+
+Unbeknownst to us, only the first two of individual $i$'s five covariates actually impacts her personal treatment effect $\tau_i$. That is, if two individuals $i'$ and $i^*$ satisfied $X_{i'1}=X_{i^*1}$ and $X_{i'2}=X_{i^*2}$ but $X_{i'j}\ne X_{i^*j} \; \forall j\in\{3,4,5\}$, their treatment effects would be identical: $\tau_{i'}=\tau_{i^*}$. In particular, an individual's treatment effect $\tau_i$ has the following functional form:
+
+$$
+\tau_i = \sin(X_{i1})\sin(X_{i2}) + X_{i1} + X_{i2}.
+$$
+
+Also unbeknownst to us, each individual $i$'s covariates are of standard normal distribution: $X_{ij} \sim \mathcal{N}(0,1) \; \forall i, \forall j \in \{1,\ldots,5\}$. Moreover, each individual $i$'s outcomes are a function of all five of her observed covariates, plus some random noise. In particular, we consider the following underlying outcome mechanism:
+
+$$
+Y_i^w = X_{i1} + 2X_{i2} + 3X_{i3} + 4X_{i4} + 5X_{i5} + w\tau_i + \varepsilon_i,
+$$
+
+where
+
+$$
+\varepsilon_i \sim \mathcal{N}(0,1) \text{ and } w\in\{0,1\}.
+$$
+
+We simulate data with these characteristics below.
+
+```{r}
+set.seed(41)
+
+n = 5000
+p = 5
+
+Xtrain = matrix(rnorm(n*p, mean = 0, sd = 1), # X_j ~ N(0,1)
+                nrow = n,
+                ncol = p)
+Wtrain = rbinom(n, 1, 0.5) # treatment is 50/50 random
+tautrain = sin(Xtrain[,1])*sin(Xtrain[,2]) + Xtrain[,1] + Xtrain[,2]
+Ytrain = Xtrain[,1] + 2*Xtrain[,2] + 3*Xtrain[,3] + 4*Xtrain[,4] + 
+         5*Xtrain[,5] + Wtrain*tautrain + rnorm(n, mean = 0, sd = 1)
+training = cbind(c(1:n), Xtrain, Wtrain, Ytrain, tautrain) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         W = Wtrain,
+         Y = Ytrain,
+         tau = tautrain)
+```
+
+Not knowing the true individual treatment effect mechanism $\tau_i = \sin(X_{i1})\sin(X_{i2}) + X_{i1} + X_{i2}$, we are interested in estimating an individual's average treatment effect *conditional* on her covariate profile $(X_{i1},\ldots,X_{i5})$. This conditional average treatment effect ("CATE") may be written as $\tau(\mathbf{x}) = \mathbb{E}\big[Y^1-Y^0|\mathbf{X}=\mathbf{x} \big]$. Furthermore, in addition to estimating the average treatment effects for individuals whose outcomes we have already observed, we are also interested in predicting the CATEs for individuals who may be subject to the treatment in the future. That is, we are also interested in predicting CATEs for individuals whose covariate profiles we can observe, but whose outcomes we cannot.
+
+# Causal Trees and Forests
+
+One tool for estimating this CATE function is the causal forest. Before we describe causal forests (or causal trees), we begin by introducing regression trees.
+
+The regression tree is a supervised learning technique that begins by treating the space of all covariates as a single region, and then successively partitions the covariate space into sub-regions *within which* the response variable takes on relatively homogeneous values, and *between which* the response variable takes on relatively distinct values. To predict the outcome of a future observation, its covariate values are used to navigate the tree's branches until the observation is categorized into a terminal node, or "leaf." The observation's predicted outcome is then the average (or some other function) of the outcomes of the training datapoints in that leaf.
+
+As an example, suppose we are interested in predicting the outcomes $Y$ of treated individuals ($W=1$) in the simulated dataset above, given their covariate profiles $(X_1,\ldots,X_5)$. We fit and plot a regression tree for this problem below.
+
+```{r}
+#| echo: FALSE
+
+tree_demo = rpart(Y ~ X1 + X2 + X3 + X4 + X5, data = filter(training, W==1))
+rpart.plot(tree_demo, type = 5, extra = 0, cex = 0.7) # extra = 1 to see num of obs in each leaf
+```
+
+Now suppose we observe a new individual $i^*$ who is going to be treated and whose covariate profile is $(-1, 1, 1, 0, 1)$, and we are interested in predicting her outcome using our regression tree. Beginning at the top of the diagram, since $X_{*5} = 1 \ge -0.0074$, we follow the right branch. Since $X_{4*}=0 < 0.003$, $X_{5*} = 1 \ge 0.93$, and $X_{*3} = 1 \ge 0.3$, we follow the next left, right, and right branches, respectively. Individual $i^*$ lands in the fourth leaf from the right, which—having averaged over all $91$ observations in the training data that also satisfy $X_5 \ge 0.93$, $X_4 < 0.003$, and $X_3 \ge 0.3$—predicts her outcome to be $\hat{Y}_* = 7.8$. Using the true outcome mechanism $Y^1 = X_1 + 2X_2 + 3X_3 + 4X_4 + 5X_5 + [\sin(X_1)\sin(X_2) + X_1 + X_2] + \varepsilon$, we know that $i^*$'s true outcome will be around $-1 + 2(1) + 3(1) + 0(4) + 5(1) + [\sin(-1)\sin(1)+-1+1] \approx 8.3$. Since $7.8 \approx 8.3$, our tree's predicted outcome for $i^*$ is pretty good.
+
+Notice also that the tree's earliest splits are on the values of $X_5$ and $X_4$. This makes a lot of sense! Since $X_5$ and $X_4$ have the largest coefficients ($5$ and $4$, respectively) in the true outcome mechanism, they have outsized impacts on $Y$. So, the fact that our tree is splitting on $X_5$ and $X_4$ before any other covariates means that it's doing a good job of picking up on which covariates are most important for predicting $Y$.
+
+Now that we know how to read a regression tree, an important question to ask is [*how*]{.underline} the tree's splits are determined: *At each node, how does an algorithm decide which covariate to split on, and how does it decide what value of that covariate to treat as the splitting threshold?*
+
+In the traditional prediction problem illustrated above, splits are chosen to reduce the mean squared error ("MSE") of the model's predictions by as much as possible. That is, the split is chosen to minimize
+
+$$
+MSE = \sum_{m=1}^{|T|} \sum_{i \in L_m} (Y_i - \bar{Y}_m)^2,
+$$
+
+where $|T|$ is the number of leaves in the tree, including the new leaf being added; $L_1,\ldots,L_{|T|}$ are the leaves of the tree; and $\bar{Y}_m$ is the average outcome among all individuals in the training data who were sorted into Leaf $m$ [see, e.g., @wang2024a]. Wager and Athey (2018) note that "finding the squared-error minimizing split is equivalent to maximizing the variance of" the leaves' average outcomes [@wager2018]. While Wager and Athey (2018) justify this equivalence result algebraically, it is important to recognize that this result also makes good intuitive sense. On the one hand, minimizing a regression tree's MSE amounts to making each of its leaves as homogeneous as possible with respect to the outcome $Y$. On the other hand, maximizing $\mathrm{Var}(\bar{Y}_m)$ amounts to making its leaves as distinct from one another as possible with respect to the outcome $Y$. These are precisely the objectives of a regression tree: to partition the covariate space into sub-regions *within which* observations have homogeneous outcomes, and *between which* observations have distinct outcomes.
+
+Causal trees, like regression trees, partition the covariate space into sub-regions *within which* a certain quantity is homogeneous, and *between which* that quantity is distinct. Causal trees and regression trees differ in what that quantity is. Whereas regression trees attempt to partition the covariate space into sub-regions with distinct outcomes $Y$, causal trees attempt to partition the covariate space into sub-regions with distinct conditional average treatment effects $\tau$. Since no observation's individual treatment effect can be known, each sub-region's conditional average treatment effect must be estimated. A natural choice for this estimator is the difference between the leaf's average outcome for treated individuals and its average outcome for non-treated individuals:
+
+$$
+\bar{\tau}_m = \frac{\sum_{i:W_i=1, i\in L_m}Y_i}{|\{i : W_i=1, i\in L_m\}|}  - \frac{\sum_{i:W_i=0,i\in L_m} Y_i}{|\{i:W_i=0,i\in L_m\}|}.
+$$ {#eq-CFestimator}
+
+Since causal trees are used to estimate treatment effects rather than predict outcomes, our criterion for partitioning the covariate space into sub-regions will naturally be different for causal trees than it was for regression trees. At first glance, a reasonable suggestion for this splitting criterion might be modifying the regression tree's criterion to minimize the MSE of treatment effects estimates rather than of predicted outcomes. That is, a reasonable splitting criterion might be choosing each split to minimize
+
+$$
+MSE = \sum_{m=1}^{|T|} \sum_{i \in L_m} (\tau_i - \bar{\tau}_m)^2.
+$$
+
+However, in practice, each individual's treatment effect $\tau_i$ is not known, and so the MSE of a causal tree's treatment effect estimates cannot be calculated, let alone minimized. Fortunately, we can leverage Wager and Athey (2018)'s aforementioned equivalence result to reframe this optimization problem into one that *can* be solved. In particular, our causal tree will choose each split to maximize $\mathrm{Var}(\bar{\tau}_m)$. This characterization of the optimization problem accentuates that we are partitioning the sample space into leaves *between which* the conditional average treatment effects are distinct — though this is equivalent to our original idea of creating leaves *within which* individuals' treatment effects are homogeneous.
+
+Various other splitting criteria for causal trees (e.g., "squared $t$-statistic trees" and "fit-based trees") have been considered as well, but we do not address those in this tutorial [@athey2016]. Moreover, procedures for growing causal trees can be sorted into "honest" algorithms—which use one subset of the training data to determine the tree's splits and a separate subset of the training data to estimate leaves' treatment effects $\tau_m$—and "dishonest" algorithms—which do not. Honesty is discussed extensively in Wager and Athey (2018), but is not a focus of this tutorial.
+
+As an example, suppose we attempt to use a causal tree to estimate the CATEs of individuals under the setting of Section 2. We fit and plot a causal tree for this problem below. Note that we have pruned the causal tree so that it only contains a handful of leaves; the unpruned tree is highly intricate, but also a little bit of an eyesore.
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+
+ctree_demo = causalTree(Y ~ X1 + X2 + X3 + X4 + X5,
+                        data = training,
+                        treatment = training$W,
+                        split.Rule = "CT",
+                        split.Honest = T)
+```
+
+```{r}
+#| echo: FALSE
+
+rpart.plot(prune(ctree_demo, cp = 0.0001), type = 5, extra = 0, cex = 0.8)
+```
+
+Suppose we observe a new individual $i^*$ whose covariate profile is $(1,1,0,0,0)$ and we are interested in estimating her treatment effect using our causal tree. Since $X_{*2} = 1 \ge -0.37$ and $X_{*1} = 1 \ge 0.35$, individual $i^*$ lands in the rightmost leaf, which has a CATE of $\tau = 2.6$. Using the true individual treatment effect mechanism $\tau_i = \sin(X_{i1})\sin(X_{i2}) + X_{i1} + X_{i2}$, we know that $i^*$'s true treatment effect is roughly $\tau_* = \sin(1)\sin(1) + 1 + 1 \approx 2.7$. Since $2.6 \approx 2.7$, our causal tree's estimated treatment effect for $i^*$ is pretty good. It is also noteworthy that all splitting points in this (pruned) tree are on $X_1$ or $X_2$; the causal tree has correctly detected that the treatment effect is only a function of the first two covariates.
+
+A significant shortcoming of the causal tree is its sharp decision boundaries, which mean that miniscule changes to an individual's covariate profile can have large effects on their estimated CATEs. For example, in the decision tree above, if an individual $i$ has $X_{i2} = -0.371$, she would follow the left branch at the first split, and her estimated treatment effect would be $-1.4$. If her second covariate value was just $0.002$ units larger so that $X_{i2} = -0.369$, she would follow the right branch and her estimated treatment effect would instead be $-0.096$, $18$, or $2.6$, all of which are pretty different from $-1.4$.
+
+This problem motivates the development of the causal forest, which is an ensemble of many causal trees. To ensure that the trees in the forest are distinct from one another, each is trained on a random subset of the training data, and at each node, each tree only considers a random subset of the covariates when determining where to split. Since each causal tree is fit in a way that is oblivious to certain observations and certain covariates, no one tree in the forest will be optimal. But just as a genetically diverse population of organisms is more likely to persevere in the wild than a genetically identical species, a diverse forest of causal trees is better able to predict individuals' treatment effects than a lone tree. Specifically, Wager and Athey (2018) explain that "it is often better to generate many different decent-looking trees and average their predictions, instead of seeking a single highly-optimized tree," since "this aggregation scheme helps reduce variance and smooths sharp decision boundaries," and since "it is not always clear what the 'best' causal tree is" in the first place [@wager2018].
+
+Below, we fit a causal forest to the data we simulated in Section 2. To evaluate the quality of our forest, we simulate a *new* set of 5,000 individuals whose covariates, treatment assignments, true individual treatment effects, and outcomes are generated in exactly the same way as our training data was. We then use our forest to estimate the individual treatment effects of these 5,000 individuals, which we compare with their true individual treatment effects.
+
+```{r}
+#| output: FALSE
+
+forest1 = causal_forest(X = select(training, -c(ID, W, Y, tau)),
+                        W = training$W,
+                        Y = training$Y,
+                        honesty = T,
+                        seed = 1)
+```
+
+```{r}
+#| echo: FALSE
+
+set.seed(212)
+
+Xtest1 = matrix(rnorm(n*p, mean = 0, sd = 1), # X_j ~ N(0,1)
+                nrow = n,
+                ncol = p)
+Wtest1 = rbinom(n, 1, 0.5) # treatment is 50/50 random
+tautest1 = sin(Xtest1[,1])*sin(Xtest1[,2]) + Xtest1[,1] + Xtest1[,2]
+Ytest1 = Xtest1[,1] + 2*Xtest1[,2] + 3*Xtest1[,3] + 4*Xtest1[,4] + 
+         5*Xtest1[,5] + Wtest1*tautest1 + rnorm(n, mean = 0, sd = 1)
+testing1 = cbind(c(1:n), Xtest1, Wtest1, Ytest1, tautest1) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         W = Wtest1,
+         Y = Ytest1,
+         tau = tautest1)
+```
+
+As shown in the plot below, our causal forest does an excellent job estimating the CATEs of the individuals in the testing data, with the $(\tau,\hat{\tau})$ pairs generally hugging the 45^o^ line. The MSE of our fit is roughly $0.16$, which is great.
+
+```{r}
+#| echo: FALSE
+
+tau_true_1 = testing1$tau
+tau_hat_forest1 = predict(forest1, select(testing1, -c(ID, W, Y, tau))) %>%
+  rename(tau_hat_forest1 = predictions)
+taus1 = as.data.frame(cbind(tau_true_1, tau_hat_forest1))
+
+ggplot(taus1, aes(x = tau_true_1, y = tau_hat_forest1)) +
+  theme_bw() +
+  geom_point(col = "red", alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linewidth = 1.5) +
+  xlab(paste0("True Treatment Effect")) +
+  ylab(paste0("Estimated Treatment Effect")) +
+  annotate("text", x = -3, y = 2.5, label = "MSE = 0.16", size = 5)
+
+# mean((taus1$tau_hat_forest1 - taus1$tau_true_1)^2) # 0.16
+```
+
+In addition to estimating the CATEs for each individual in the testing data given their specific covariate profiles, we may also be interested in estimating the functional form of the CATE, so that we can easily estimate future individuals' treatment effects by "plugging in" their covariate profiles. Tibshirani, Athey, Sverdrup, and Wager's `grf` package in R provides a function `best_linear_projection()` for doing just that [@tibshirani]. In particular, this function finds the optimal linear approximation of the CATE by solving the following linear regression problem:
+
+$$
+\mathbb{E}\big[Y^1-Y^0 \,|\, X_1,\ldots,X_5\big] = \hat{\beta}_0 + \hat{\beta}_1 X_1 + \cdots + \hat{\beta_5} X_5.
+$$
+
+In our case, we generate the following coefficient estimates. Notice that our estimates of $\hat{\beta}_1 \text{ and } \hat{\beta}_2$ are both statistically significant at well below the $\alpha=0.001$ level, while our estimates of $\hat{\beta}_0, \hat{\beta}_3, \hat{\beta}_4, \text{ and } \hat{\beta}_5$ are all close to $0$ and not statistically significant. These estimates further illustrate that our causal forest has successfully detected that the CATE varies with $X_1$ and $X_2$ but not with $X_3$, $X_4$, or $X_5$.
+
+```{r}
+best_linear_projection(forest1, A = training[,2:6])
+```
+
+To further drive this point home, we plot the true CATE surface (blue) and the best linear estimate of the CATE function (orange) in the $(X_1, X_2, \tau)$ space below. It is somewhat difficult to make out in the 3D plot, but the estimated CATE plane closely follows the general shape of the CATE surface.
+
+```{r}
+#| eval: FALSE
+#| echo: FALSE
+
+# See also https://www.desmos.com/3d/bjw6k5nu03
+
+coords_X2 = rep(-5, 101)
+for(i in c(1:100)){
+  coords_X2 = append(coords_X2, rep(-5+i*0.1, 101))
+}
+coords_X2 = coords_X2 %>% as.data.frame() %>% rename(X2 = ".")
+rm(i)
+
+coords = matrix(rep(0, 30603),
+              nrow = 10201,
+              ncol = 3) %>%
+  as.data.frame() %>%
+  rename(X1 = V1, X2 = V2, tau = V3) %>%
+  mutate(X1 = rep(c(-50:50)/10, 101),
+         X2 = coords_X2$X2,
+         tau_RW = sin(X1) + sin(X2) + X1 + X2,
+         tau_RW_hat = 1.007480*X1 + 0.943047*X2)
+
+plot_ly() %>%
+  add_trace(data = coords, x = coords$X1, y = coords$X2, z = coords$tau_RW, 
+            type = "mesh3d") %>%
+  add_trace(data = coords, x = coords$X1, y = coords$X2, z = coords$tau_RW_hat,
+            type = "mesh3d")
+```
+
+![](surfaceplot_RW.png)
+
+# Causal $k$-Nearest Neighbors
+
+Another (much simpler) tool for estimating the CATE is a causal $k$-nearest neighbors ("KNN") algorithm. Traditionally, KNN models have been used to predict an individual's outcome by finding other individuals with known outcomes whose covariate profiles resemble that of the individual being predicted. Specifically, for each individual $i$ in the prediction dataset, and for some fixed $k \in \mathbb{N}$, a KNN model finds the $k$ individuals in the training data whose covariate profiles were the closest to $i$'s, where closeness is defined in terms of some distance metric. The model then predicts $i$'s outcome to simply be the average outcome of these $k$ neighbors.
+
+For example, suppose we set $k=2$ and want to predict the outcome $Y$ for the first individual in our testing dataset from Section 3, whose covariate profile is roughly $(-0.24, -1.80, -0.12, -0.65, -1.83)$. Using the standard Euclidean distance metric in $\mathbb{R}^5$, her two nearest neighbors in the training data are individuals $2399$ and $4162$, whose covariate profiles are roughly $(-0.78, -1.91, -0.31, -0.43, -2.14)$ and $(-0.16, -1.82, -0.26, -0.30, -1.23)$, respectively. These individuals' outcomes were $Y_{2399} \approx -19.06$ and $Y_{4162} \approx -11.38$, so a $2$NN model would predict our target unit's outcome to be $\frac{-19.06-11.38}{2} = -15.22$. Her actual outcome was $Y\approx-14.41$, so our $2$NN model's prediction wasn't that bad.
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+
+# Individual being predicted
+testing1[1,]
+
+# Indices of two nearest neighbors: 2399, 4162
+get.knnx(data = select(training, -c(ID, W, Y, tau)),
+         query = testing1[1,2:6],
+         k = 2)$nn.index
+
+# Profiles of these two nearest neighbors
+training[c(2399,4162),]
+
+# 2NN prediction
+knn.reg(train = select(training, -c(ID, W, Y, tau)),
+        test = testing1[1,2:6],
+        y = training$Y,
+        k = 2)
+```
+
+The basic causal KNN algorithm for estimating treatment effects generalizes the traditional KNN algorithm for prediction in a natural way [@kricke2019]. For each individual $i$ whose treatment effect we are estimating, the causal KNN algorithm finds the $k$ [treated]{.underline} individuals in the training data whose covariate profiles were closest to $i$'s, as well as the $k$ [non-treated]{.underline} individuals in the training data whose covariate profiles were closest to $i$'s, so that it finds $2k$ neighbors of $i$ in total. Individual $i$'s treatment effect is then simply estimated as the difference between the average outcomes of the $k$ treated neighbors and the $k$ non-treated neighbors:
+
+$$
+\bar{\tau}_i = \frac{\sum_{j=1 : W_j=1}^{2k} Y_j}{k} - \frac{\sum_{j=1:W_j=0}^{2k} Y_j}{k}.
+$$ {#eq-CKNNestimator}
+
+More sophisticated variations on the causal KNN algorithm exist, such as Zhou and Kosorok's (2017) adaptive causal KNN algorithm, though these are not a focus of this tutorial [@zhou2017].
+
+Continuing with our above example, suppose we now want to estimate the treatment effect for the first individual in Section 3's testing data using $2$NN. Of the two nearest neighbors we found above, one (individual $2399$) was treated, and one (individual $4162$) was not. So, we'll need to find our target individual's second-nearest treated neighbor, as well as her second-nearest non-treated neighbor. Her two nearest treated neighbors in the training data are individuals $2399$ (from before) and $4119$, whose outcomes were $Y_{2399}\approx-19.06$ and $Y_{4119}\approx-14.97$, respectively. Her two nearest non-treated neighbors in the training data are individuals $4162$ (from before) and $4015$, whose outcomes were $Y_{4162}\approx-11.38$ and $Y_{4015}\approx-15.69$, respectively. So, a causal $2$NN model would predict this individual's treatment effect to be roughly $\frac{-19.06-14.97}{2} - \frac{-11.38 - 15.69}{2} = -3.48$. Her actual outcome was $-1.81$, so our causal $2$NN wasn't amazing (but it least it got the right sign on the effect estimate!).
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+
+# Two nearest treated neighbors: 2399, 4119
+get.knnx(data = select(filter(training, W == 1), -c(ID, W, Y, tau)),
+         query = testing1[1,2:6],
+         k = 2)$nn.index
+filter(training, W == 1)[c(1230,2095),]
+
+# Two nearest non-treated neighbors: 4162, 4015
+get.knnx(data = select(filter(training, W == 0), -c(ID, W, Y, tau)),
+         query = testing1[1,2:6],
+         k = 2)$nn.index
+filter(training, W == 0)[c(2047,1975),]
+
+# 2NN Prediction: -3.49
+knn.reg(train = select(filter(training, W == 1), -c(ID, W, Y, tau)),
+        test = testing1[1,2:6],
+        y = filter(training, W == 1)$Y,
+        k = 2)$pred -
+  knn.reg(train = select(filter(training, W == 0), -c(ID, W, Y, tau)),
+          test = testing1[1,2:6],
+          y = filter(training, W == 0)$Y,
+          k = 2)$pred
+```
+
+We now repeat this process on all 5,000 individuals in the testing data from Section 3, this time using $k=100$ neighbors from Section 2's training data rather than the $k=2$ neighbors we used for illustration purposes. Once again, more sophisticated methods exist for determining the optimal number of neighbors $k$, but for simplicity, and to align with Wager and Athey's (2018) simulations, we simply use $k=100$ [see, for example, @kricke2019]. To evaluate the quality of our model, we compare the resulting estimates to these individuals' true treatment effects, just as we did with Section 3's causal forest.
+
+```{r}
+set.seed(60)
+
+# Train Causal KNN
+knn_treated1 = knn.reg(train = select(filter(training, W == 1),
+                                      -c(ID, W, Y, tau)),
+                       test = select(testing1, -c(ID, W, Y, tau)),
+                       y = filter(training, W == 1)$Y,
+                       k = 100
+)
+
+knn_control1 = knn.reg(train = select(filter(training, W == 0),
+                                      -c(ID, W, Y, tau)),
+                       test = select(testing1, -c(ID, W, Y, tau)),
+                       y = filter(training, W == 0)$Y,
+                       k = 100
+)
+
+tau_hat_knn1 = knn_treated1$pred - knn_control1$pred
+```
+
+As shown in the plot below, our causal KNN model does a good job of estimating the CATEs of the individuals in the testing data, with the $(\tau, \hat{\tau})$ pairs generally hugging the 45^o^ line. The MSE of our fit is roughly $0.57$, which is very good, but roughly $3.56$ times worse than our causal forest's MSE of $0.16$.
+
+```{r}
+#| echo: FALSE
+taus1 = taus1 %>% mutate(tau_hat_knn1 = tau_hat_knn1)
+
+ggplot(taus1, aes(x = tau_true_1, y = tau_hat_knn1)) +
+  theme_bw() +
+  geom_point(aes(x=tau_true_1, y=tau_hat_knn1), col = "blue", alpha = 0.5) + 
+  geom_abline(slope = 1, intercept = 0, linewidth = 1.5) +
+  xlab(paste0("True Treatment Effects")) +
+  ylab(paste0("Estimated Treatment Effects")) +
+  annotate("text", x = -3, y = 3, label = "MSE = 0.57", size = 5)
+
+# mean((taus1$tau_hat_knn1 - taus1$tau_true_1)^2) # 0.57
+```
+
+# Causal Forests vs. Causal KNN with Covariate Shift
+
+Despite their differences, causal trees/forests and causal KNN methods bear a number of similarities. Firstly, both methods are nearest neighbor methods in the sense that they each estimate an individual's treatment effect by aggregating over the outcomes of individuals with similar covariate profiles in the training data [see, e.g., @lin2006]. Specifically, causal trees operationalize "similar covariate profiles" using sub-regions of the partitioned covariate space, while causal KNN methods operationalize "similar covariate profiles" using a distance metric.
+
+Causal trees/forests and causal KNN methods also have similar ways of aggregating outcomes to estimate treatment effects. As shown in @eq-CFestimator, causal trees estimate an individual's treatment effect as the difference between the average outcome among treated units and the average outcome among non-treated units in the same sub-region of the covariate space as the individual of interest. And as shown in @eq-CKNNestimator, the causal KNN algorithm estimates an individual's treatment effect as the difference between the average outcome among that unit's $k$ nearest treated neighbors and the average outcome among that unit's $k$ nearest non-treated neighbors. In short, both methods estimate an individual's treatment effect as the difference between the average outcomes of treated and non-treated units with similar covariate profiles.
+
+A consequence of these facts is yet another similarity: both causal trees/forests and causal KNN methods perform poorly in the case of **covariate shift**. Covariate shift occurs when the distribution of covariates and/or the range of their values are different among the individuals whose treatment effects are being estimated than they were among the individuals on which the model was fit. Covariate shift is plausible in many real-world data analysis problems. For instance, covariate shift often occurs "when using heterogeneous biological data to aid causal inference in complex biological networks" [@lecca2021]. Because causal trees/forests and causal KNN methods estimate treatment effects by averaging over the outcomes of units that have already been observed, these methods cannot extrapolate treatment effects for outlier covariate values that didn't appear in the training data [see, e.g., @lecca2021]. For example, if a new individual had covariate values that were ten times larger than the covariate values of any unit in the training data, this individual's treatment effect would still be estimated based on training units' outcomes, even though their covariate profiles are so different. This is in stark contrast with methods like linear regression, which multiply coefficient estimates by outlier covariate values to extrapolate new units' outcomes (with the caveat that these extrapolations are not always good).
+
+Covariate shift was not a problem in Wager and Athey's (2018) simulations because they only consider CATEs that plateau once covariate values become large or small enough, and hence are bounded above and below. Indeed, their "first experiment" in Section 5 considers a null treatment effect: $\tau(x)=0$. Their "second experiment" considers a treatment effect with the following functional form:
+
+$$
+\tau(X) = \varsigma(X_1) \cdot \varsigma(X_2), \text{ where } \varsigma(x) = 1 + \frac{1}{1+e^{-20(x-1/3)}},
+$$
+
+which plateaus at $4$ if $X_1$ and $X_2$ are both large and positive, at $2$ if one of $X_1$ and $X_2$ is large and positive and the other is large and negative, and $1$ if $X_1$ and $X_2$ are both large and negative. Their "third experiment" considers a treatment effect with the following functional form:
+
+$$
+\tau(X) = \zeta(X_1) \cdot \zeta(X_2), \text{ where } \zeta(x) = \frac{2}{1 + e^{-12(x-1/2)}},
+$$
+
+which plateaus at $4$ if $X_1$ and $X_2$ are both large and positive, and plateaus at $0$ otherwise. Because all of these CATE surfaces level off, new individuals with extreme covariate values will still have treatment effects that are in line with those in the training data. For example, suppose we are working with the CATE surface from Wager and Athey's (2018) second experiment. If individual $i$ has $X_{i1} = X_{i2} = 1$, her true treatment effect is $\varsigma(1)\cdot\varsigma(1) \approx 4$. If individual $j$ has $X_{j1}=X_{j2}=100 \gg 1$, his true treatment effect is *also* $\varsigma(100)\cdot\varsigma(100) \approx 4$. If we used a causal forest or causal KNN network to estimate $j$'s treatment effect, *even if* every unit in the training data had a covariate profile like $i$'s and not $j$'s, we'll *still* recover a good estimate, since $j$'s true treatment effect cannot be much larger than $i$'s. We depict Wager and Athey's (2018) two CATE surfaces (excluding the trivial surface from their first experiment) below.
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+#| eval: FALSE
+
+varsigma = function(x){1 + 1/(1+exp(-20*(x-1/3)))}
+zeta = function(x){2/(1+exp(-12*(x-1/2)))}
+
+coords = coords %>%
+  mutate(tau_WA2 = varsigma(X1) * varsigma(X2),
+         tau_WA3 = zeta(X1) * zeta(X2))
+
+plot_ly() %>%
+  add_trace(data = coords, x = coords$X1, y = coords$X2, z = coords$tau_WA2, 
+            type = "mesh3d")
+
+plot_ly() %>%
+  add_trace(data = coords, x = coords$X1, y = coords$X2, z = coords$tau_WA3, 
+            type = "mesh3d")
+```
+
+::: {layout-ncol="2"}
+![Experiment 2 CATE Surface](surface_WA2.png){width="300"}
+
+![Experiment 3 CATE Surface](surface_WA3.png){width="300"}
+:::
+
+In general, however, there is no reason to believe that a CATE surface should be bounded. That is, in many cases, it is reasonable to believe that as an individual's covariates grow without bound, so too will her treatment effect. This is the case for the CATE surface we proposed in Section 2:
+
+$$
+\tau_i = \sin(X_{i1})\sin(X_{i2}) + X_{i1} + X_{i2}.
+$$
+
+In these cases, covariate shift is a problem, and it affects the performance of both causal forests *and* causal KNN networks. Lecca (2021) writes that covariate shift is difficult for causal KNN to handle, but is "especially" difficult for causal forests [@lecca2021]. To close out this tutorial, we explore Lecca's (2021) claim using a final simulation.
+
+Specifically, we will use Section 3's causal forest and Section 4's causal KNN network to estimate the treatment effects of a population that has experienced covariate shift. That is, we consider a *new* population of 5,000 individuals whose treatment assignments, true treatment effects, and outcomes are generated in exactly the same way as our training data was, but whose covariates are each drawn from the $t$ distribution with $2$ degrees of freedom rather than the standard normal distribution. Recall that the density of the $t_2$ distribution resembles that of the $\mathcal{N}(0,1)$ distribution, but it has fatter tails, meaning that outlier covariate values are much more likely to arise in this new testing dataset than they were in the training data.
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+
+# Generate new testing data, this time X_j ~ t2
+
+set.seed(212)
+
+Xtest2 = matrix(rt(n*p, df = 2), # X_j ~ t2
+                nrow = n,
+                ncol = p)
+Wtest2 = rbinom(n, 1, 0.5) # treatment is 50/50 random
+tautest2 = sin(Xtest2[,1])*sin(Xtest2[,2]) + Xtest2[,1] + Xtest2[,2] # True 
+Ytest2 = Xtest2[,1] + 2*Xtest2[,2] + 3*Xtest2[,3] + 4*Xtest2[,4] + 
+         5*Xtest2[,5] + Wtest2*tautest2 + rnorm(n, mean = 0, sd = 1)
+testing2 = cbind(c(1:n), Xtest2, Wtest2, Ytest2, tautest2) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         W = Wtest2,
+         Y = Ytest2,
+         tau = tautest2)
+```
+
+Below, we plot our causal forest's estimates of the new population's treatment effects against their true treatment effects. Notice that the horizontal axis, which shows true treatment values, is on a log scale, since our outlier covariates mean that we now have outlier treatment effects. The thick black line is still the 45^o^ line, contorted in this log-linear plot. Notice also that all of the forest's estimated treatment effects are between around $-2$ and $3.5$, even though some true treatment effects are as small as $-100$ or as large as $200$! This is an illustration of the causal forest's inability to extrapolate treatment effects outside of the range it was trained on. The forest's inability to extrapolate has caused the MSE to increase from roughly $0.16$ in Section 3 to around $18.91$ now.
+
+```{r}
+#| echo: FALSE
+
+# causal forest estimates
+
+tau_true_2 = testing2$tau
+tau_hat_forest2 = predict(forest1, select(testing2, -c(ID, W, Y, tau))) %>%
+  rename(tau_hat_forest2 = predictions)
+taus2 = as.data.frame(cbind(tau_true_2, tau_hat_forest2))
+
+linedata = cbind(c(-100:100), c(-100:100)) %>%
+  as.data.frame()
+
+ggplot(taus2, aes(x = tau_true_2, y = tau_hat_forest2)) +
+  theme_bw() +
+  geom_point(col = "red", alpha = 0.5) +
+  geom_line(data = linedata, aes(x=V1, y=V2), linewidth = 1.5) + # 45o line
+  ylim(min = -3, max = 4) +
+  xlab(paste0("True Treatment Effects")) +
+  ylab(paste0("Estimated Treatment Effects")) +
+  annotate("text", x = -20, y = 3, label = "MSE = 18.91", size = 5) +
+  scale_x_continuous(trans=pseudolog10_trans,
+                     breaks = c(-100, -10, 0, 10, 100, 200))
+
+# mean((taus2$tau_hat_forest2 - taus2$tau_true_2)^2) # 18.91
+```
+
+Now, we produce a similar plot of our causal KNN network's estimates of the new population's treatment effects against their true treatment effects. We see that the causal KNN network also struggles to extrapolate, with estimated treatment effects spanning roughly $-3$ to $5.5$, even though some true treatment effects are as small as $-100$ or as large as $200$. However, at least in this case, the causal KNN network seems to have extrapolated better than the causal forest, which only produced treatment effect estimates between $-2$ and $3.5$. The causal KNN network's MSE has increased from roughly $0.57$ in Section 4 to around $19.07$ now.
+
+```{r}
+#| echo: FALSE
+
+# Train Causal KNN
+
+set.seed(60)
+
+knn_treated2 = knn.reg(train = select(filter(training, W == 1),
+                                      -c(ID, W, Y, tau)),
+                       test = select(testing2, -c(ID, W, Y, tau)),
+                       y = filter(training, W == 1)$Y,
+                       k = 100
+)
+
+knn_control2 = knn.reg(train = select(filter(training, W == 0),
+                                      -c(ID, W, Y, tau)),
+                       test = select(testing2, -c(ID, W, Y, tau)),
+                       y = filter(training, W == 0)$Y,
+                       k = 100
+)
+
+tau_hat_knn2 = knn_treated2$pred - knn_control2$pred
+taus2 = taus2 %>% mutate(tau_hat_knn2 = tau_hat_knn2)
+
+ggplot(taus2, aes(x = tau_true_2, y = tau_hat_knn2)) +
+  theme_bw() +
+  geom_point(aes(x=tau_true_2, y=tau_hat_knn2), col = "blue", alpha = 0.5) + 
+  geom_line(data = linedata, aes(x=V1, y=V2), linewidth = 1.5) + # 45o line
+  ylim(min = -3.5, max = 5.5) +
+  xlab(paste0("True Treatment Effects")) +
+  ylab(paste0("Estimated Treatment Effects")) +
+  annotate("text", x = -20, y = 4, label = "MSE = 19.07", size = 5) +
+  scale_x_continuous(trans=pseudolog10_trans,
+                     breaks = c(-100, -10, 0, 10, 100, 200))
+
+# mean((taus2$tau_hat_knn2 - taus2$tau_true_2)^2) # 19.07
+```
+
+It's striking that, in the presence of covariate shift, the causal KNN network has "caught up" to the causal forest in terms of MSE! In Sections 3 and 4, without covariate shift, the MSE of the causal KNN network's estimates was roughly $0.57/0.16 \approx 3.6$ times larger than the MSE of the causal forest's estimates. Now, in the presence of covariate shift, the two methods have MSEs that are practically identical ($18.91$ and $19.07$). Thus, despite Wager and Athey's (2018) findings, the presence of covariate shift is one setting in which causal KNN methods are still competitive with causal forests.
+
+<!--# OLD CODE -->
+
+```{r}
+#| eval: FALSE
+#| echo: FALSE
+#| output: FALSE
+
+# TO UPDATE --- TEST ON CAUCHY DATA
+
+set.seed(41)
+
+n = 2000
+p = 5
+
+zeta = function(x){
+  z = 1 + 1/(1+exp(-20*(x-1/3)))
+  return(z)
+}
+
+# Training Data: Covariates drawn from N(0,1)
+Xtrain = matrix(rnorm(n*p, mean = 0, sd = 1),
+                nrow = n,
+                ncol = p)
+#Wtrain = rbinom(n, 1, 0.4 + 0.2 * (Xtrain[,1]>0)) # Treatment allocation
+Wtrain = rbinom(n, 1, 0.5)
+tautrain = zeta(Xtrain[,1]) * zeta(Xtrain[,2]) # True treatment effect
+Ytrain = Wtrain*tautrain + rnorm(n, mean = 0, sd = 1) # outcome w/ normal noise
+training = cbind(c(1:n), Xtrain, Wtrain, Ytrain, tautrain) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         # V6 = V7, X7 = V8, X8 = V9, X9 = V10, X10 = V11,
+         W = Wtrain,
+         Y = Ytrain,
+         tau = tautrain)
+
+# Testing Data: Covariates drawn from N(1,1)
+Xtest = matrix(rcauchy(n*p, location = 0, scale = 1),
+               nrow = n,
+               ncol = p)
+#Wtest = rbinom(n, 1, 0.4 + 0.2 * (Xtest[,1]>0)) # Treatment allocation
+Wtest = rbinom(n,1,0.5)
+tautest = zeta(Xtest[,1]) * zeta(Xtest[,2]) # True treatment effect
+Ytest = Wtest*tautest + rnorm(n, mean = 0, sd = 1) # outcome w/ normal noise
+testing = cbind(c(1:n), Xtest, Wtest, Ytest, tautest) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         # X6 = V7, X7 = V8, X8 = V9, X9 = V10, X10 = V11,
+         W = Wtest,
+         Y = Ytest,
+         tau = tautest)
+  
+
+# Train forest on training data
+forest_training = causal_forest(X = select(training, -c(ID, W, Y, tau)), 
+                                W = training$W,
+                                Y = training$Y,
+                                seed = 41)
+
+# Train Causal KNN
+knn_treated = knn.reg(train = select(filter(training, W == 1),
+                                     -c(ID, W, Y, tau)),
+                      test = select(testing, -c(ID, W, Y, tau)),
+                      y = filter(training, W == 1)$Y,
+                      k = 100
+)
+
+knn_control = knn.reg(train = select(filter(training, W == 0),
+                                     -c(ID, W, Y, tau)),
+                      test = select(testing, -c(ID, W, Y, tau)),
+                      y = filter(training, W == 0)$Y,
+                      k = 100
+)
+
+# Plotting
+tau_true = testing$tau
+tau_hat_forest = predict(forest_training, select(testing, -c(ID, W, Y, tau))) %>%
+  rename(tau_hat_forest = predictions)
+tau_hat_knn = knn_treated$pred - knn_control$pred
+tau_estimates = cbind(tau_true, tau_hat_forest, tau_hat_knn)
+
+ggplot(tau_estimates) +
+  theme_bw() +
+  geom_point(aes(x=tau_true, y=tau_hat_forest), col = "red", alpha = 0.5) +
+  # geom_point(aes(x=tau_true, y=tau_hat_knn), col = "blue", alpha = 0.5) + 
+  geom_abline(slope = 1, intercept = 0, linewidth = 1.5)
+
+# Residuals
+sum((tau_estimates$tau_hat_forest - tau_estimates$tau_true)^2) # Forest
+sum((tau_estimates$tau_hat_knn - tau_estimates$tau_true)^2) # KNN
+```
+
+```{r}
+#| echo: FALSE
+#| output: FALSE
+#| eval: FALSE
+
+# OLD: Model on uniform and beta data
+
+set.seed(41)
+
+n = 2000
+p = 5
+
+zeta = function(x){
+  z = 1 + 1/(1+exp(-20*(x-1/3)))
+  return(z)
+}
+
+# Training Data: Covariates drawn from N(0,1)
+Xtrain = matrix(runif(n*p, min = -1, max = 1),
+                nrow = n,
+                ncol = p)
+# Wtrain = rbinom(n, 1, 0.4 + 0.2 * (Xtrain[,1]>0)) # Treatment allocation
+Wtrain = rbinom(n, 1, 0.5) # random assignment
+tautrain = zeta(Xtrain[,1]) * zeta(Xtrain[,2]) # True treatment effect
+Ytrain = Wtrain*tautrain + rnorm(n, mean = 0, sd = 1) # outcome w/ normal noise
+training = cbind(c(1:n), Xtrain, Wtrain, Ytrain, tautrain) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         # V6 = V7, X7 = V8, X8 = V9, X9 = V10, X10 = V11,
+         W = Wtrain,
+         Y = Ytrain,
+         tau = tautrain)
+
+# Testing Data: Covariates drawn from N(1,1)
+Xtest = matrix(rbeta(n*p, shape1 = 1.5, shape2 = 1.5),
+               nrow = n,
+               ncol = p)
+# Wtest = rbinom(n, 1, 0.4 + 0.2 * (Xtest[,1]>0)) # Treatment allocation
+Wtest = rbinom(n, 1, 0.5) # random assignment
+tautest = zeta(Xtest[,1]) * zeta(Xtest[,2]) # True treatment effect
+Ytest = Wtest*tautest + rnorm(n, mean = 0, sd = 1) # outcome w/ normal noise
+testing = cbind(c(1:n), Xtest, Wtest, Ytest, tautest) %>%
+  as.data.frame() %>%
+  rename(ID = V1,
+         X1 = V2, X2 = V3, X3 = V4, X4 = V5, X5 = V6,
+         # X6 = V7, X7 = V8, X8 = V9, X9 = V10, X10 = V11,
+         W = Wtest,
+         Y = Ytest,
+         tau = tautest)
+  
+
+# Train forest on training data
+forest_training = causal_forest(X = select(training, -c(ID, W, Y, tau)), 
+                                W = training$W,
+                                Y = training$Y,
+                                seed = 41)
+
+# Train Causal KNN
+knn_treated = knn.reg(train = select(filter(training, W == 1),
+                                     -c(ID, W, Y, tau)),
+                      test = select(testing, -c(ID, W, Y, tau)),
+                      y = filter(training, W == 1)$Y,
+                      k = 100
+)
+
+knn_control = knn.reg(train = select(filter(training, W == 0),
+                                     -c(ID, W, Y, tau)),
+                      test = select(testing, -c(ID, W, Y, tau)),
+                      y = filter(training, W == 0)$Y,
+                      k = 100
+)
+
+# Plotting
+tau_true = testing$tau
+tau_hat_forest = predict(forest_training, select(testing, -c(ID, W, Y, tau))) %>%
+  rename(tau_hat_forest = predictions)
+tau_hat_knn = knn_treated$pred - knn_control$pred
+tau_estimates = cbind(tau_true, tau_hat_forest, tau_hat_knn)
+
+ggplot(tau_estimates) +
+  theme_bw() +
+  geom_point(aes(x=tau_true, y=tau_hat_forest), col = "red", alpha = 0.5) +
+  geom_point(aes(x=tau_true, y=tau_hat_knn), col = "blue", alpha = 0.5) + 
+  geom_abline(slope = 1, intercept = 0, linewidth = 1.5)
+
+# Residuals
+sum((tau_estimates$tau_hat_forest - tau_estimates$tau_true)^2) # Forest
+sum((tau_estimates$tau_hat_knn - tau_estimates$tau_true)^2) # KNN
+```
+
+# References
